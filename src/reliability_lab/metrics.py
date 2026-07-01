@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import csv
 import json
 from pathlib import Path
 from statistics import median
@@ -21,6 +22,7 @@ class RunMetrics(BaseModel):
     estimated_cost_saved: float = 0.0
     latencies_ms: list[float] = Field(default_factory=list)
     scenarios: dict[str, str] = Field(default_factory=dict)
+    scenario_details: dict[str, dict[str, object]] = Field(default_factory=dict)
 
     @property
     def availability(self) -> float:
@@ -42,6 +44,16 @@ class RunMetrics(BaseModel):
     def percentile(self, q: float) -> float:
         return percentile(self.latencies_ms, q)
 
+    def check_slos(self) -> dict[str, bool]:
+        """Check whether system metrics meet defined SLOs."""
+        return {
+            "availability_gte_99pct": self.availability >= 0.99,
+            "p95_lt_2500ms": self.percentile(95) < 2500.0,
+            "error_rate_lt_1pct": self.error_rate < 0.01,
+            "cache_hit_rate_gte_30pct": self.cache_hit_rate >= 0.30,
+            "fallback_success_rate_gte_90pct": self.fallback_success_rate >= 0.90,
+        }
+
     def to_report_dict(self) -> dict[str, object]:
         return {
             "total_requests": self.total_requests,
@@ -57,6 +69,8 @@ class RunMetrics(BaseModel):
             "estimated_cost": round(self.estimated_cost, 6),
             "estimated_cost_saved": round(self.estimated_cost_saved, 6),
             "scenarios": self.scenarios,
+            "scenario_details": self.scenario_details,
+            "slo_results": self.check_slos(),
         }
 
     def write_json(self, path: str | Path) -> None:
@@ -72,7 +86,16 @@ class RunMetrics(BaseModel):
         3. Write a single-row CSV with csv.DictWriter (import csv at top of file)
         4. Create parent directories if needed
         """
-        raise NotImplementedError("TODO: implement write_csv()")
+        d = self.to_report_dict()
+        scenarios = d.pop("scenarios")
+        d.pop("scenario_details", None)
+        if isinstance(scenarios, dict):
+            d.update({f"scenario_{k}": v for k, v in scenarios.items()})
+        Path(path).parent.mkdir(parents=True, exist_ok=True)
+        with open(path, "w", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=d.keys())
+            writer.writeheader()
+            writer.writerow(d)
 
 
 def percentile(values: Iterable[float], q: float) -> float:

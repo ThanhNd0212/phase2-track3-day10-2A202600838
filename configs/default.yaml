@@ -34,3 +34,11 @@ scenarios:
   - name: all_healthy
     description: "Baseline — both providers healthy"
     provider_overrides: {}
+  - name: all_healthy_with_cache
+    description: "Baseline với cache bật — đo cache hit rate và cost saved"
+    provider_overrides: {}
+    cache_enabled: true
+  - name: all_healthy_no_cache
+    description: "Baseline không cache — so sánh latency, cost, availability"
+    provider_overrides: {}
+    cache_enabled: false

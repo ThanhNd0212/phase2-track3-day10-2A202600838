@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import random
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 from reliability_lab.cache import ResponseCache, SharedRedisCache
@@ -21,7 +22,11 @@ def load_queries(path: str | Path = "data/sample_queries.jsonl") -> list[str]:
     return queries
 
 
-def build_gateway(config: LabConfig, provider_overrides: dict[str, float] | None = None) -> ReliabilityGateway:
+def build_gateway(
+    config: LabConfig,
+    provider_overrides: dict[str, float] | None = None,
+    cache_enabled: bool | None = None,
+) -> ReliabilityGateway:
     providers = []
     for p in config.providers:
         fail_rate = provider_overrides.get(p.name, p.fail_rate) if provider_overrides else p.fail_rate
@@ -35,8 +40,9 @@ def build_gateway(config: LabConfig, provider_overrides: dict[str, float] | None
         )
         for p in config.providers
     }
+    use_cache = cache_enabled if cache_enabled is not None else config.cache.enabled
     cache: ResponseCache | SharedRedisCache | None = None
-    if config.cache.enabled:
+    if use_cache:
         if config.cache.backend == "redis":
             cache = SharedRedisCache(
                 config.cache.redis_url,
@@ -62,7 +68,17 @@ def calculate_recovery_time_ms(gateway: ReliabilityGateway) -> float | None:
     Each transition_log entry is a dict with keys: "from", "to", "reason", "ts"
     where "ts" is time.time() (epoch seconds).
     """
-    raise NotImplementedError("TODO: implement calculate_recovery_time_ms()")
+    recovery_times: list[float] = []
+    for breaker in gateway.breakers.values():
+        open_ts: float | None = None
+        for entry in breaker.transition_log:
+            if entry["to"] == "open":
+                open_ts = float(entry["ts"])
+            elif entry["to"] == "closed" and open_ts is not None:
+                delta_ms = (float(entry["ts"]) - open_ts) * 1000
+                recovery_times.append(delta_ms)
+                open_ts = None
+    return sum(recovery_times) / len(recovery_times) if recovery_times else None
 
 
 def run_scenario(config: LabConfig, queries: list[str], scenario: ScenarioConfig) -> RunMetrics:
@@ -86,7 +102,39 @@ def run_scenario(config: LabConfig, queries: list[str], scenario: ScenarioConfig
     5. Set recovery_time_ms via calculate_recovery_time_ms(gateway)
     6. Return metrics
     """
-    raise NotImplementedError("TODO: implement run_scenario()")
+    gateway = build_gateway(config, scenario.provider_overrides or None, scenario.cache_enabled)
+    metrics = RunMetrics()
+
+    for _ in range(config.load_test.requests):
+        query = random.choice(queries)
+        result = gateway.complete(query)
+
+        metrics.total_requests += 1
+        metrics.estimated_cost += result.estimated_cost
+
+        if result.cache_hit:
+            metrics.cache_hits += 1
+            metrics.estimated_cost_saved += 0.001
+            metrics.successful_requests += 1
+        elif result.route == "static_fallback":
+            metrics.static_fallbacks += 1
+            metrics.failed_requests += 1
+        elif result.route == "fallback":
+            metrics.fallback_successes += 1
+            metrics.successful_requests += 1
+        else:
+            metrics.successful_requests += 1
+
+        if result.latency_ms > 0:
+            metrics.latencies_ms.append(result.latency_ms)
+
+    metrics.circuit_open_count = sum(
+        1 for breaker in gateway.breakers.values()
+        for entry in breaker.transition_log
+        if entry["to"] == "open"
+    )
+    metrics.recovery_time_ms = calculate_recovery_time_ms(gateway)
+    return metrics
 
 
 def run_simulation(config: LabConfig, queries: list[str]) -> RunMetrics:
@@ -102,13 +150,39 @@ def run_simulation(config: LabConfig, queries: list[str]) -> RunMetrics:
         return metrics
 
     combined = RunMetrics()
-    for scenario in config.scenarios:
-        result = run_scenario(config, queries, scenario)
+    with ThreadPoolExecutor(max_workers=min(len(config.scenarios), 4)) as executor:
+        futures = {
+            executor.submit(run_scenario, config, queries, scenario): scenario
+            for scenario in config.scenarios
+        }
+        scenario_results = []
+        for future in as_completed(futures):
+            scenario = futures[future]
+            result = future.result()
+            scenario_results.append((scenario, result))
+    for scenario, result in sorted(scenario_results, key=lambda x: x[0].name):
 
         # TODO(student): Define pass/fail criteria per scenario.
         # Example: primary_timeout_100 passes if fallback_success_rate > 0.9
         passed = result.successful_requests > 0
         combined.scenarios[scenario.name] = "pass" if passed else "fail"
+
+        # Lưu metrics chi tiết từng scenario để so sánh
+        combined.scenario_details[scenario.name] = {
+            "total_requests": result.total_requests,
+            "availability": round(result.availability, 4),
+            "error_rate": round(result.error_rate, 4),
+            "cache_hit_rate": round(result.cache_hit_rate, 4),
+            "fallback_success_rate": round(result.fallback_success_rate, 4),
+            "latency_p50_ms": round(result.percentile(50), 2),
+            "latency_p95_ms": round(result.percentile(95), 2),
+            "latency_p99_ms": round(result.percentile(99), 2),
+            "circuit_open_count": result.circuit_open_count,
+            "recovery_time_ms": result.recovery_time_ms,
+            "estimated_cost": round(result.estimated_cost, 6),
+            "estimated_cost_saved": round(result.estimated_cost_saved, 6),
+            "status": "pass" if passed else "fail",
+        }
 
         combined.total_requests += result.total_requests
         combined.successful_requests += result.successful_requests

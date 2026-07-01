@@ -36,6 +36,7 @@ class ScenarioConfig(BaseModel):
     name: str
     description: str = ""
     provider_overrides: dict[str, float] = Field(default_factory=dict)
+    cache_enabled: bool | None = None  # None = dùng giá trị từ config chính
 
 
 class LabConfig(BaseModel):
